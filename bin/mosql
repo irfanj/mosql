@@ -2,4 +2,68 @@
 
 require 'mosql/cli'
 
+module MoSQL
+  class Schema
+    def transform(ns, obj, schema=nil, depth = 0)
+      schema ||= find_ns!(ns)
+
+      original = obj
+
+      # Do a deep clone, because we're potentially going to be
+      # mutating embedded objects.
+      obj = BSON.deserialize(BSON.serialize(obj))
+
+      row = []
+      schema[:columns].each do |col|
+
+        source = col[:source]
+        type = col[:type]
+
+        if source.start_with?("$")
+          v = fetch_special_source(obj, source, original)
+        else
+          v = fetch_and_delete_dotted(obj, source)
+          case v
+          when Hash
+            v = JSON.dump(Hash[v.map { |k,v| [k, transform_primitive(v)] }])
+          when Array
+            v = v.map { |it| transform_primitive(it) }
+            if col[:array_type]
+              v = Sequel.pg_array(v, col[:array_type])
+            else
+              v = JSON.dump(v)
+            end
+          else
+            v = transform_primitive(v, type)
+          end
+        end
+        row << v
+      end
+
+      if schema[:meta][:extra_props]
+        extra = sanitize(obj)
+        row << JSON.dump(extra)
+      end
+
+      log.debug { "Transformed: #{row.inspect}" }
+
+      row
+    rescue BSON::InvalidStringEncoding, BSON::InvalidDocument
+      obj = obj.select do |k,v|
+        begin
+          BSON.deserialize(BSON.serialize({"#{k}" => v}))
+          true
+        rescue BSON::InvalidStringEncoding, BSON::InvalidDocument
+          puts "Pruning #{k} from the hash."
+          false
+        end
+      end
+
+      raise "tried and failed to prune with #{[ns, obj, schema]}" if depth > 2
+      transform(ns, obj, schema, depth + 1)
+    end
+  end
+end
+
+
 MoSQL::CLI.run(ARGV)
